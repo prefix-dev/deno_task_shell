@@ -42,22 +42,31 @@ impl ShellCommand for ExecutableCommand {
         };
 
       let mut sub_command = tokio::process::Command::new(&command_path);
-      let child = sub_command
-        .current_dir(context.state.cwd())
-        .args(&context.args)
-        .gid(10)
-        .env_clear()
-        .envs(context.state.env_vars())
-        .stdout(context.stdout.into_stdio())
-        .stdin(context.stdin.into_stdio())
-        .stderr(stderr.clone().into_stdio())
-        .spawn();
+      let child = unsafe {
+        let child = sub_command
+          .current_dir(context.state.cwd())
+          .args(&context.args)
+          .env_clear()
+          .pre_exec(move || {
+            let pid = nix::unistd::getpid();
+            nix::unistd::setpgid(pid, pid).expect("could not set group id");
+            Ok(())
+          })
+          .envs(context.state.env_vars())
+          .stdout(context.stdout.into_stdio())
+          .stdin(context.stdin.into_stdio())
+          .stderr(stderr.clone().into_stdio())
+          .spawn();
+        child
+      };
 
       let mut child = match child {
         Ok(child) => {
-          nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(10)).unwrap();
+          let child_pgid = Pid::from_raw(child.id().unwrap() as i32);
+          nix::unistd::tcsetpgrp(0, child_pgid)
+            .expect("could not make child terminal parent");
           child
-        },
+        }
         Err(err) => {
           stderr
             .write_line(&format!("Error launching '{command_name}': {err}"))
@@ -71,18 +80,24 @@ impl ShellCommand for ExecutableCommand {
 
       tokio::select! {
         result = child.wait() => match result {
-          Ok(status) => ExecuteResult::Continue(
+          Ok(status) => {
+            stderr.write_line("Ok");
+            nix::unistd::tcsetpgrp(0, nix::unistd::getpid()).unwrap();
+        ExecuteResult::Continue(
             status.code().unwrap_or(1),
             Vec::new(),
             Vec::new(),
-          ),
+          )},
           Err(err) => {
             let _ = stderr.write_line(&format!("{err}"));
+            nix::unistd::tcsetpgrp(0, nix::unistd::getpid()).unwrap();
             ExecuteResult::Continue(1, Vec::new(), Vec::new())
           }
         },
         _ = context.state.token().cancelled() => {
+          stderr.write_line("Cancelled");
           let _ = child.kill().await;
+          nix::unistd::tcsetpgrp(0, nix::unistd::getpid()).unwrap();
           ExecuteResult::for_cancellation()
         }
       }
