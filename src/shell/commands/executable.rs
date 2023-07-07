@@ -8,6 +8,7 @@ use anyhow::bail;
 use anyhow::Result;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
+use nix::unistd::Pid;
 
 /// Command that resolves the command name and
 /// executes it in a separate process.
@@ -44,6 +45,7 @@ impl ShellCommand for ExecutableCommand {
       let child = sub_command
         .current_dir(context.state.cwd())
         .args(&context.args)
+        .gid(10)
         .env_clear()
         .envs(context.state.env_vars())
         .stdout(context.stdout.into_stdio())
@@ -52,7 +54,10 @@ impl ShellCommand for ExecutableCommand {
         .spawn();
 
       let mut child = match child {
-        Ok(child) => child,
+        Ok(child) => {
+          nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(10)).unwrap();
+          child
+        },
         Err(err) => {
           stderr
             .write_line(&format!("Error launching '{command_name}': {err}"))
